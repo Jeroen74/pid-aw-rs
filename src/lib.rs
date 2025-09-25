@@ -220,10 +220,13 @@ where
 
     /// Sets the [Self::i] term for this controller, with different minimum and maximum.
     pub fn i2(&mut self, gain: impl Into<T>, min: impl Into<T>, max: impl Into<T>) -> &mut Self {
-        // TODO: raise error when min > max
-        self.ki = gain.into();
         let i_min = min.into();
         let i_max = max.into();
+        if i_min.clone() > i_max.clone() {
+            error!("min > max");
+            error!("Unable to set iterator minimum and maximum");
+        }
+        self.ki = gain.into();
         self.i_min = i_min.clone();
         self.i_max = i_max.clone();
         self.i_limit = if i_min > i_max { i_min } else { i_max };
