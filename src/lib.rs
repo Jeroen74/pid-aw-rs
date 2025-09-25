@@ -136,6 +136,8 @@ pub struct Pid<T: Number> {
     integrator_leak: Option<T>,
     /// Make integrator leak conditional
     integrator_leak_condition: Option<fn(T, T, T, T) -> bool>,
+    /// Enable back calculating with setting a time tracking constant, for anti-windup
+    tt: Option<T>,
 }
 
 /// Output of [controller iterations](Pid::next_control_output) with weights
@@ -198,6 +200,7 @@ where
             conditional_integration: None,
             integrator_leak: None,
             integrator_leak_condition: None,
+            tt: None,
         }
     }
 
@@ -277,6 +280,11 @@ where
     ///    }
     ///    ```
     pub fn aw_conditional_integration(&mut self, fun: fn(T, T, T, T) -> bool) -> &mut Self {
+        if let Some(_) = self.tt {
+            warn!("Unable to use conditional integration with back calculating.");
+            warn!("Disabled back calculating.");
+            self.tt = None;
+        }
         self.conditional_integration = Some(fun);
         self
     }
@@ -288,6 +296,11 @@ where
             error!("Integrator leak not set.");
             self
         } else {
+            if let Some(_) = self.tt {
+                warn!("Unable to use integrator leak with back calculating.");
+                warn!("Disabled back calculating.");
+                self.tt = None;
+            }
             self.integrator_leak = Some(leak_rate);
             self
         }
@@ -300,10 +313,35 @@ where
             error!("Integrator leak not set.");
             self
         } else {
+            if let Some(_) = self.tt {
+                warn!("Unable to use integrator leak with back calculating.");
+                warn!("Disabled back calculating.");
+                self.tt = None;
+            }
             self.integrator_leak = Some(leak_rate);
             self.integrator_leak_condition = Some(fun);
             self
         }
+    }
+
+    /// TODO: documentation
+    pub fn aw_back_calculation(&mut self, tt: Option<T>) -> &mut Self {
+        if let Some(_) = self.conditional_integration {
+            warn!("Unable to use conditional integration with back calculating.");
+            warn!("Disabled conditional integration.");
+            self.conditional_integration = None;
+        }
+        if let Some(_) = self.integrator_leak {
+            warn!("Unable to use integrator leak with back calculating.");
+            warn!("Disabled integrator leak.");
+            self.integrator_leak = None;
+            self.integrator_leak_condition = None;
+        }
+        self.tt = match tt {
+            Some(tt) => Some(tt),
+            None => Some(self.kp / self.ki),
+        };
+        self
     }
 
     /// Given a new measurement, calculates the next [control output](ControlOutput).
@@ -331,6 +369,7 @@ where
 
         let pred_output = p + self.integral_term + d;
 
+        // TODO: documentation
         if match self.conditional_integration {
             Some(fun) => fun(pred_output, self.i_min, self.i_max, error),
             None => true,
@@ -353,6 +392,13 @@ where
             // we store the entire term so that we don't need to remember previous
             // ki values.
             self.integral_term = self.integral_term + error * self.ki;
+        }
+
+        // TODO: documentation
+        if let Some(tt) = self.tt {
+            let u_act = p_unbounded + self.integral_term + d_unbounded;
+            let tracking = (u_act - pred_output) / tt;
+            self.integral_term = self.integral_term + error * self.ki + tracking;
         }
 
         // Mitigate integral windup: Don't want to keep building up error
@@ -425,6 +471,7 @@ mod tests {
 
     /// Derivative-only controller operation and limits
     #[test]
+    // TODO: Write new tests
     fn derivative() {
         let mut pid = Pid::new(10.0, 100.0);
         pid.p(0.0, 100.0).i(0.0, 100.0).d(2.0, 100.0);
