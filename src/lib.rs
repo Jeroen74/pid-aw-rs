@@ -117,8 +117,10 @@ pub struct Pid<T: Number> {
     pub kd: T,
     /// Limiter for the proportional term: `-p_limit <= P <= p_limit`.
     pub p_limit: T,
-    /// Limiter for the integral term: `-i_limit <= I <= i_limit`.
-    pub i_limit: T,
+    /// Limiter for the integral term: `-i_limit <= I.
+    pub i_min: T,
+    /// Limiter for the integral term: `I <= i_limit`.
+    pub i_max: T,
     /// Limiter for the derivative term: `-d_limit <= D <= d_limit`.
     pub d_limit: T,
     /// Last calculated integral value if [Pid::ki] is used.
@@ -176,7 +178,8 @@ where
             ki: T::zero(),
             kd: T::zero(),
             p_limit: T::zero(),
-            i_limit: T::zero(),
+            i_min: T::zero(),
+            i_max: T::zero(),
             d_limit: T::zero(),
             integral_term: T::zero(),
             prev_measurement: None,
@@ -193,7 +196,17 @@ where
     /// Sets the [Self::i] term for this controller.
     pub fn i(&mut self, gain: impl Into<T>, limit: impl Into<T>) -> &mut Self {
         self.ki = gain.into();
-        self.i_limit = limit.into();
+        let limit_val: T = limit.into();
+        self.i_min = limit_val.clone();
+        self.i_max = limit_val;
+        self
+    }
+
+    /// Sets the [Self::i] term for this controller, with different minimum and maximum.
+    pub fn i2(&mut self, gain: impl Into<T>, min: impl Into<T>, max: impl Into<T>) -> &mut Self {
+        self.ki = gain.into();
+        self.i_min = min.into();
+        self.i_max = max.into();
         self
     }
 
@@ -233,7 +246,7 @@ where
 
         // Mitigate integral windup: Don't want to keep building up error
         // beyond what i_limit will allow.
-        self.integral_term = apply_limit(self.i_limit, self.integral_term);
+        self.integral_term = apply_limit2(self.i_min, self.i_max, self.integral_term);
 
         // Mitigate derivative kick: Use the derivative of the measurement
         // rather than the derivative of the error.
@@ -281,6 +294,11 @@ where
 /// Saturating the input `value` according the absolute `limit` (`-abs(limit) <= output <= abs(limit)`).
 fn apply_limit<T: Number>(limit: T, value: T) -> T {
     num_traits::clamp(value, -limit.abs(), limit.abs())
+}
+
+/// Saturating the input `value` according the absolute `limit` (`min <= output <= max`).
+fn apply_limit2<T: Number>(min: T, max: T, value: T) -> T {
+    num_traits::clamp(value, min, max)
 }
 
 #[cfg(test)]
@@ -332,7 +350,8 @@ mod tests {
         assert_eq!(pid.next_control_output(5.0).output, 50.0);
 
         // Test limit
-        pid.i_limit = 50.0;
+        pid.i_min = 50.0;
+        pid.i_max = 50.0;
         assert_eq!(pid.next_control_output(5.0).output, 50.0);
         // Test that limit doesn't impede reversal of error integral
         assert_eq!(pid.next_control_output(15.0).output, 40.0);
@@ -343,7 +362,8 @@ mod tests {
         assert_eq!(pid2.next_control_output(0.0).output, -20.0);
         assert_eq!(pid2.next_control_output(0.0).output, -40.0);
 
-        pid2.i_limit = 50.0;
+        pid.i_min = 50.0;
+        pid.i_max = 50.0;
         assert_eq!(pid2.next_control_output(-5.0).output, -50.0);
         // Test that limit doesn't impede reversal of error integral
         assert_eq!(pid2.next_control_output(-15.0).output, -40.0);
