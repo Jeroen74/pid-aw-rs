@@ -102,6 +102,7 @@ impl<T: PartialOrd + num_traits::Signed + Copy> Number for T {}
 /// # Type Warning
 ///
 /// [Number] is abstract and can be used with anything from a [i32] to an [i128] (as well as user-defined types). Because of this, very small types might overflow during calculation in [`next_control_output`](Self::next_control_output). You probably don't want to use [i8] or user-defined types around that size so keep that in mind when designing your controller.
+#[allow(unpredictable_function_pointer_comparisons)]
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
 pub struct Pid<T: Number> {
@@ -127,6 +128,8 @@ pub struct Pid<T: Number> {
     integral_term: T,
     /// Previously found measurement whilst using the [Pid::next_control_output] method.
     prev_measurement: Option<T>,
+    /// Enables conditional integration is set to some value, for anti-windup
+    conditional_integration: Option<fn(T, T, T, T) -> bool>
 }
 
 /// Output of [controller iterations](Pid::next_control_output) with weights
@@ -183,6 +186,7 @@ where
             d_limit: T::zero(),
             integral_term: T::zero(),
             prev_measurement: None,
+            conditional_integration: None,
         }
     }
 
@@ -196,14 +200,15 @@ where
     /// Sets the [Self::i] term for this controller.
     pub fn i(&mut self, gain: impl Into<T>, limit: impl Into<T>) -> &mut Self {
         self.ki = gain.into();
-        let limit_val: T = limit.into();
-        self.i_min = limit_val.clone();
+        let limit_val: T = limit.into().abs();
+        self.i_min = -limit_val.clone();
         self.i_max = limit_val;
         self
     }
 
     /// Sets the [Self::i] term for this controller, with different minimum and maximum.
     pub fn i2(&mut self, gain: impl Into<T>, min: impl Into<T>, max: impl Into<T>) -> &mut Self {
+        // TODO: raise error when min > max
         self.ki = gain.into();
         self.i_min = min.into();
         self.i_max = max.into();
@@ -223,6 +228,42 @@ where
         self
     }
 
+    /// Enables conditional integration for the integral term.
+    ///
+    /// The provided function decides whether the current error should
+    /// contribute to the integral term. If the condition evaluates to `true`,
+    /// the error is added; otherwise, the integral is left unchanged.
+    ///
+    /// The function signature is:
+    ///
+    /// `fn(u_pred, i_min, i_max, e) -> bool`
+    ///
+    /// - `u_pred`: predicted controller output *before* updating the integral term
+    /// - `i_min`: lower bound of the integral term
+    /// - `i_max`: upper bound of the integral term
+    /// - `e`: current error (setpoint - measurement)
+    ///
+    /// # Examples
+    ///
+    /// 1. Prevent integration while saturating:
+    ///    ```ignore
+    ///    fn(u_pred, i_min, i_max, e) -> bool {
+    ///        !(u_pred >= i_max && e > 0.0) && !(u_pred <= i_min && e < 0.0)
+    ///    }
+    ///    ```
+    ///
+    /// 2. Integrate only for small errors:
+    ///    ```ignore
+    ///    fn(_u_pred, _i_min, _i_max, e) -> bool {
+    ///        e.abs() < 10.0
+    ///    }
+    ///    ```
+    pub fn aw_conditional_integration(&mut self, fun: fn(T, T, T, T) -> bool) -> &mut Self {
+        self.conditional_integration = Some(fun);
+        self
+    }
+
+
     /// Given a new measurement, calculates the next [control output](ControlOutput).
     ///
     /// # Panics
@@ -237,17 +278,6 @@ where
         let p_unbounded = error * self.kp;
         let p = apply_limit(self.p_limit, p_unbounded);
 
-        // Mitigate output jumps when ki(t) != ki(t-1).
-        // While it's standard to use an error_integral that's a running sum of
-        // just the error (no ki), because we support ki changing dynamically,
-        // we store the entire term so that we don't need to remember previous
-        // ki values.
-        self.integral_term = self.integral_term + error * self.ki;
-
-        // Mitigate integral windup: Don't want to keep building up error
-        // beyond what i_limit will allow.
-        self.integral_term = apply_limit2(self.i_min, self.i_max, self.integral_term);
-
         // Mitigate derivative kick: Use the derivative of the measurement
         // rather than the derivative of the error.
         let d_unbounded = -match self.prev_measurement.as_ref() {
@@ -256,6 +286,27 @@ where
         } * self.kd;
         self.prev_measurement = Some(measurement);
         let d = apply_limit(self.d_limit, d_unbounded);
+
+        let pred_output = p + self.integral_term + d;
+
+        // Only add the error term to the integral if:
+        // - the condition function returns true, or
+        // - no condition function is set.
+        if match self.conditional_integration {
+            Some(fun) => fun(pred_output, self.i_min, self.i_max, error),
+            None => true,
+        } {
+            // Mitigate output jumps when ki(t) != ki(t-1).
+            // While it's standard to use an error_integral that's a running sum of
+            // just the error (no ki), because we support ki changing dynamically,
+            // we store the entire term so that we don't need to remember previous
+            // ki values.
+            self.integral_term = self.integral_term + error * self.ki;
+        }
+
+        // Mitigate integral windup: Don't want to keep building up error
+        // beyond what i_limit will allow.
+        self.integral_term = apply_limit2(self.i_min, self.i_max, self.integral_term);
 
         // Calculate the final output by adding together the PID terms, then
         // apply the final defined output limit
@@ -350,7 +401,7 @@ mod tests {
         assert_eq!(pid.next_control_output(5.0).output, 50.0);
 
         // Test limit
-        pid.i_min = 50.0;
+        pid.i_min = -50.0;
         pid.i_max = 50.0;
         assert_eq!(pid.next_control_output(5.0).output, 50.0);
         // Test that limit doesn't impede reversal of error integral
@@ -362,7 +413,7 @@ mod tests {
         assert_eq!(pid2.next_control_output(0.0).output, -20.0);
         assert_eq!(pid2.next_control_output(0.0).output, -40.0);
 
-        pid.i_min = 50.0;
+        pid.i_min = -50.0;
         pid.i_max = 50.0;
         assert_eq!(pid2.next_control_output(-5.0).output, -50.0);
         // Test that limit doesn't impede reversal of error integral
