@@ -130,6 +130,7 @@ pub struct Pid<T: Number> {
     integral_term: T,
     /// Previously found measurement whilst using the [Pid::next_control_output] method.
     prev_measurement: Option<T>,
+    // TODO: Update README
     /// Enables conditional integration is set to some value, for anti-windup
     conditional_integration: Option<fn(T, T, T, T) -> bool>,
     /// Enable integrator leaking, for anti-windup
