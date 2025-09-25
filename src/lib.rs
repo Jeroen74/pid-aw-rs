@@ -131,7 +131,11 @@ pub struct Pid<T: Number> {
     /// Previously found measurement whilst using the [Pid::next_control_output] method.
     prev_measurement: Option<T>,
     /// Enables conditional integration is set to some value, for anti-windup
-    conditional_integration: Option<fn(T, T, T, T) -> bool>
+    conditional_integration: Option<fn(T, T, T, T) -> bool>,
+    /// Enable integrator leaking, for anti-windup
+    integrator_leak: Option<T>,
+    /// Make integrator leak conditional
+    integrator_leak_condition: Option<fn(T, T, T, T) -> bool>,
 }
 
 /// Output of [controller iterations](Pid::next_control_output) with weights
@@ -165,6 +169,8 @@ pub struct ControlOutput<T: Number> {
     pub output: T,
 }
 
+use defmt::*;
+
 impl<T> Pid<T>
 where
     T: Number,
@@ -190,6 +196,8 @@ where
             integral_term: T::zero(),
             prev_measurement: None,
             conditional_integration: None,
+            integrator_leak: None,
+            integrator_leak_condition: None,
         }
     }
 
@@ -270,6 +278,30 @@ where
         self
     }
 
+    /// TODO: documentation
+    pub fn aw_integrator_leak(&mut self, leak_rate: T) -> &mut Self {
+        if leak_rate > T::one() {
+            error!("Leak rate must be smaller than 1!");
+            error!("Integrator leak not set.");
+            self
+        } else {
+            self.integrator_leak = Some(leak_rate);
+            self
+        }
+    }
+
+    /// TODO: documentation
+    pub fn aw_conditional_integrator_leak(&mut self, leak_rate: T, fun: fn(T, T, T, T) -> bool) -> &mut Self {
+        if leak_rate > T::one() {
+            error!("Leak rate must be smaller than 1!");
+            error!("Integrator leak not set.");
+            self
+        } else {
+            self.integrator_leak = Some(leak_rate);
+            self.integrator_leak_condition = Some(fun);
+            self
+        }
+    }
 
     /// Given a new measurement, calculates the next [control output](ControlOutput).
     ///
@@ -295,6 +327,15 @@ where
         let d = apply_limit(self.d_limit, d_unbounded);
 
         let pred_output = p + self.integral_term + d;
+
+        if match self.conditional_integration {
+            Some(fun) => fun(pred_output, self.i_min, self.i_max, error),
+            None => true,
+        } {
+            if let Some(integrator_leak) = self.integrator_leak {
+                self.integral_term = integrator_leak * self.integral_term;
+            }
+        }
 
         // Only add the error term to the integral if:
         // - the condition function returns true, or
