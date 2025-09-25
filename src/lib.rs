@@ -118,10 +118,12 @@ pub struct Pid<T: Number> {
     pub kd: T,
     /// Limiter for the proportional term: `-p_limit <= P <= p_limit`.
     pub p_limit: T,
-    /// Limiter for the integral term: `-i_limit <= I.
+    /// Limiter for the integral term: `-i_min <= I`.
     pub i_min: T,
-    /// Limiter for the integral term: `I <= i_limit`.
+    /// Limiter for the integral term: `I <= i_max`.
     pub i_max: T,
+    /// Limiter for the integral term, defined by i_min and i_max: `i_limit = max(i_min.abs(), i_max.abs())`.
+    pub i_limit: T,
     /// Limiter for the derivative term: `-d_limit <= D <= d_limit`.
     pub d_limit: T,
     /// Last calculated integral value if [Pid::ki] is used.
@@ -183,6 +185,7 @@ where
             p_limit: T::zero(),
             i_min: T::zero(),
             i_max: T::zero(),
+            i_limit: T::zero(),
             d_limit: T::zero(),
             integral_term: T::zero(),
             prev_measurement: None,
@@ -202,7 +205,8 @@ where
         self.ki = gain.into();
         let limit_val: T = limit.into().abs();
         self.i_min = -limit_val.clone();
-        self.i_max = limit_val;
+        self.i_max = limit_val.clone();
+        self.i_limit = limit_val;
         self
     }
 
@@ -210,8 +214,11 @@ where
     pub fn i2(&mut self, gain: impl Into<T>, min: impl Into<T>, max: impl Into<T>) -> &mut Self {
         // TODO: raise error when min > max
         self.ki = gain.into();
-        self.i_min = min.into();
-        self.i_max = max.into();
+        let i_min = min.into();
+        let i_max = max.into();
+        self.i_min = i_min.clone();
+        self.i_max = i_max.clone();
+        self.i_limit = if i_min > i_max { i_min } else { i_max };
         self
     }
 
