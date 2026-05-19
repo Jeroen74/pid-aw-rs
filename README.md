@@ -28,9 +28,8 @@ A proportional-integral-derivative (PID) controller.
 * Optional support for [Serde](https://crates.io/crates/serde). Enable the
   `serde` Cargo feature, if you need `Pid` to implement
   `Serialize`/`Deserialize`.
-* Optional support for [defmt](https://crates.io/crates/defmt). Enable the
-  `defmt` Cargo feature to log invalid configuration warnings on embedded
-  targets that support it.
+* Checked output via `safe_next_control_output`, which returns `PidError` for
+  invalid anti-windup configuration.
 
 ## Cargo Features
 
@@ -39,13 +38,6 @@ This crate has no default features.
 ```toml
 [dependencies]
 pid = "4.1.0"
-```
-
-Enable `defmt` support when logging should be emitted through `defmt`:
-
-```toml
-[dependencies]
-pid = { version = "4.1.0", features = ["defmt"] }
 ```
 
 ## Example
@@ -190,6 +182,9 @@ pid.setpoint(10.0);
 assert_eq!(pid.next_control_output(0.0).i, 15.0);
 ```
 
+Use `disable_aw_integrator_leak_condition()` to keep the same leak rate but
+make the leak unconditional again.
+
 Back-calculation pulls the integral term back while the controller output is
 saturated by `output_limit`.
 
@@ -211,7 +206,20 @@ assert_eq!(output.output, 10.0);
 ```
 
 Back-calculation is mutually exclusive with conditional integration and
-integrator leak. Enabling one of these modes disables the conflicting mode.
+integrator leak. Use `safe_next_control_output()` when you want invalid
+anti-windup settings reported as `PidError` values.
+
+```rust
+use pid::{Pid, PidError};
+
+let mut pid = Pid::new(10.0, 10.0);
+pid.i2(1.0, 10.0, -10.0);
+
+assert_eq!(
+    pid.safe_next_control_output(0.0),
+    Err(PidError::InvalidIntegralLimits)
+);
+```
 
 ## Assumptions
 

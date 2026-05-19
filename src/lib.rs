@@ -47,28 +47,21 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-#[cfg(all(feature = "defmt", not(test)))]
-macro_rules! log_error {
-    ($($arg:tt)*) => {{
-        defmt::error!($($arg)*);
-    }};
-}
-
-#[cfg(any(not(feature = "defmt"), test))]
-macro_rules! log_error {
-    ($($arg:tt)*) => {{}};
-}
-
-#[cfg(all(feature = "defmt", not(test)))]
-macro_rules! log_warn {
-    ($($arg:tt)*) => {{
-        defmt::warn!($($arg)*);
-    }};
-}
-
-#[cfg(any(not(feature = "defmt"), test))]
-macro_rules! log_warn {
-    ($($arg:tt)*) => {{}};
+/// Error returned by [Pid::safe_next_control_output()] for invalid controller configuration.
+///
+/// These errors are only reported by the checked output path. The unchecked
+/// [Pid::next_control_output()] method preserves the existing behavior and does
+/// not validate stored anti-windup settings before calculating an output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidError {
+    /// The configured integral lower limit is greater than the upper limit.
+    InvalidIntegralLimits,
+    /// The configured integrator leak rate is lower than 0 or greater than 1.
+    InvalidIntegratorLeakRate,
+    /// The configured back-calculation tracking time is less than or equal to zero.
+    InvalidBackCalculationTrackingTime,
+    /// Back-calculation is configured together with another anti-windup mode.
+    AntiWindupCombinationError,
 }
 
 /// A trait for any numeric type usable in the PID controller
@@ -165,7 +158,7 @@ pub struct Pid<T: Number> {
     prev_measurement: Option<T>,
     /// Function that controls whether the next error is added to the integral term.
     conditional_integration: Option<AntiWindupCondition<T>>,
-     /// Integrator leak multiplier for anti-windup.
+    /// Integrator leak multiplier for anti-windup.
     integrator_leak: Option<T>,
     /// Function that controls whether the integrator leak is applied.
     integrator_leak_condition: Option<AntiWindupCondition<T>>,
@@ -258,16 +251,12 @@ where
 
     /// Sets the [Self::i] term with asymmetric minimum and maximum limits.
     ///
-    /// The integral term is clamped so that `min <= I <= max`. If `min` is
-    /// larger than `max`, the controller is left unchanged.
+    /// The integral term is clamped so that `min <= I <= max`. The values are
+    /// stored as provided; [Self::safe_next_control_output()] reports
+    /// [PidError::InvalidIntegralLimits] if `min` is larger than `max`.
     pub fn i2(&mut self, gain: impl Into<T>, min: impl Into<T>, max: impl Into<T>) -> &mut Self {
         let i_min = min.into();
         let i_max = max.into();
-        if i_min > i_max {
-            log_error!("min > max");
-            log_error!("Unable to set integral minimum and maximum");
-            return self;
-        }
         self.ki = gain.into();
         self.i_min = i_min;
         self.i_max = i_max;
@@ -323,12 +312,17 @@ where
     ///    }
     ///    ```
     pub fn aw_conditional_integration(&mut self, fun: AntiWindupCondition<T>) -> &mut Self {
-        if self.tt.is_some() {
-            log_warn!("Unable to use conditional integration with back-calculation.");
-            log_warn!("Disabled back-calculation.");
-            self.tt = None;
-        }
         self.conditional_integration = Some(fun);
+        self
+    }
+
+    /// Disables conditional integration.
+    ///
+    /// After calling this method, each unchecked controller iteration adds the
+    /// current error to the integral term normally unless another anti-windup
+    /// mode is active.
+    pub fn diable_aw_conditional_integration(&mut self) -> &mut Self {
+        self.conditional_integration = None;
         self
     }
 
@@ -336,26 +330,29 @@ where
     ///
     /// On every controller iteration, the current integral term is multiplied
     /// by `leak_rate` before the new error is integrated. A value of `1` keeps
-    /// the integrator unchanged, while `0` clears it on every iteration. Values
-    /// outside `0..=1` are rejected and leave the controller unchanged.
+    /// the integrator unchanged, while `0` clears it on every iteration.
     ///
-    /// Integrator leak cannot be combined with back-calculation. Enabling this
-    /// method disables a previously configured back-calculation mode.
+    /// The rate is stored as provided; [Self::safe_next_control_output()]
+    /// reports [PidError::InvalidIntegratorLeakRate] for values is lower 
+    /// than 0 or greater than 1.
+    ///
+    /// Integrator leak cannot be safely combined with back-calculation. Use
+    /// [Self::safe_next_control_output()] when invalid anti-windup combinations
+    /// should be reported as errors.
     pub fn aw_integrator_leak(&mut self, leak_rate: T) -> &mut Self {
-        if leak_rate < T::zero() || leak_rate > T::one() {
-            log_error!("Leak rate must be between 0 and 1!");
-            log_error!("Integrator leak not set.");
-            self
-        } else {
-            if self.tt.is_some() {
-                log_warn!("Unable to use integrator leak with back-calculation.");
-                log_warn!("Disabled back-calculation.");
-                self.tt = None;
-            }
-            self.integrator_leak = Some(leak_rate);
-            self.integrator_leak_condition = None;
-            self
-        }
+        self.integrator_leak = Some(leak_rate);
+        self.integrator_leak_condition = None;
+        self
+    }
+
+    /// Disables integrator leak and clears any leak condition.
+    ///
+    /// This keeps the current accumulated integral value but stops applying leak
+    /// decay before future integration steps.
+    pub fn disable_aw_integrator_leak(&mut self) -> &mut Self {
+        self.integrator_leak = None;
+        self.integrator_leak_condition = None;
+        self
     }
 
     /// Enables integrator leaking only when a condition function returns `true`.
@@ -367,28 +364,30 @@ where
     /// multiplied by `leak_rate`; otherwise the leak is skipped for that
     /// iteration.
     ///
-    /// Conditional integrator leak cannot be combined with back-calculation.
-    /// Enabling this method disables a previously configured back-calculation
-    /// mode.
+    /// The rate is stored as provided; [Self::safe_next_control_output()]
+    /// reports [PidError::InvalidIntegratorLeakRate] for values is lower 
+    /// than 0 or greater than 1.
+    ///
+    /// Conditional integrator leak cannot be safely combined with
+    /// back-calculation. Use [Self::safe_next_control_output()] when invalid
+    /// anti-windup combinations should be reported as errors.
     pub fn aw_conditional_integrator_leak(
         &mut self,
         leak_rate: T,
         fun: AntiWindupCondition<T>,
     ) -> &mut Self {
-        if leak_rate < T::zero() || leak_rate > T::one() {
-            log_error!("Leak rate must be between 0 and 1!");
-            log_error!("Integrator leak not set.");
-            self
-        } else {
-            if self.tt.is_some() {
-                log_warn!("Unable to use integrator leak with back-calculation.");
-                log_warn!("Disabled back-calculation.");
-                self.tt = None;
-            }
-            self.integrator_leak = Some(leak_rate);
-            self.integrator_leak_condition = Some(fun);
-            self
-        }
+        self.integrator_leak = Some(leak_rate);
+        self.integrator_leak_condition = Some(fun);
+        self
+    }
+
+    /// Disables the condition for integrator leak while preserving the leak rate.
+    ///
+    /// After calling this method, a previously configured conditional integrator
+    /// leak behaves like [Self::aw_integrator_leak()] with the same `leak_rate`.
+    pub fn disable_aw_integrator_leak_condition(&mut self) -> &mut Self {
+        self.integrator_leak_condition = None;
+        self
     }
 
     /// Enables back-calculation anti-windup for the integral term.
@@ -399,42 +398,68 @@ where
     /// [Self::output_limit].
     ///
     /// Pass `Some(tt)` to set the tracking time constant explicitly. Passing
-    /// `None` uses `kp / ki`, so `ki` must be non-zero. The tracking time
-    /// constant must be positive; invalid values are rejected and leave the
-    /// controller unchanged.
+    /// `None` uses `kp / ki` when `ki` is non-zero, or `1` when `ki` is zero.
+    /// The tracking time constant must be positive;
+    /// [Self::safe_next_control_output()] reports
+    /// [PidError::InvalidBackCalculationTrackingTime] for invalid values.
     ///
-    /// Back-calculation cannot be combined with conditional integration or
-    /// integrator leak. Enabling it disables those modes.
+    /// Back-calculation cannot be safely combined with conditional integration
+    /// or integrator leak. Use [Self::safe_next_control_output()] when invalid
+    /// anti-windup combinations should be reported as errors.
     pub fn aw_back_calculation(&mut self, tt: Option<T>) -> &mut Self {
         let tt = match tt {
             Some(tt) => tt,
-            None if self.ki == T::zero() => {
-                log_error!("Unable to derive back-calculation tracking time with zero ki.");
-                log_error!("Back-calculation not set.");
-                return self;
+            None => {
+                if self.ki != T::zero() {
+                    self.kp / self.ki
+                } else {
+                    T::one()
+                }
             }
-            None => self.kp / self.ki,
         };
-
-        if tt <= T::zero() {
-            log_error!("Back-calculation tracking time must be greater than zero.");
-            log_error!("Back-calculation not set.");
-            return self;
-        }
-
-        if self.conditional_integration.is_some() {
-            log_warn!("Unable to use conditional integration with back-calculation.");
-            log_warn!("Disabled conditional integration.");
-            self.conditional_integration = None;
-        }
-        if self.integrator_leak.is_some() {
-            log_warn!("Unable to use integrator leak with back-calculation.");
-            log_warn!("Disabled integrator leak.");
-            self.integrator_leak = None;
-            self.integrator_leak_condition = None;
-        }
         self.tt = Some(tt);
         self
+    }
+
+    /// Disables back-calculation anti-windup.
+    ///
+    /// After calling this method, the controller returns to the standard
+    /// integral update path, including any configured conditional integration or
+    /// integrator leak modes.
+    pub fn diable_aw_back_calcualtion(&mut self) -> &mut Self {
+        self.tt = None;
+        self
+    }
+
+    /// Validates anti-windup configuration before calculating the next output.
+    ///
+    /// On success, this method delegates to [Self::next_control_output()] and
+    /// advances the controller state once. On error, no output is calculated and
+    /// the controller state is left unchanged.
+    pub fn safe_next_control_output(
+        &mut self,
+        measurement: T,
+    ) -> Result<ControlOutput<T>, PidError> {
+        if self.i_min > self.i_max {
+            return Err(PidError::InvalidIntegralLimits);
+        }
+        if self.tt.is_some()
+            && (self.conditional_integration.is_some() || self.integrator_leak.is_some())
+        {
+            return Err(PidError::AntiWindupCombinationError);
+        }
+        if let Some(leak_rate) = self.integrator_leak {
+            if leak_rate < T::zero() || leak_rate > T::one() {
+                return Err(PidError::InvalidIntegratorLeakRate);
+            }
+        }
+        if let Some(tt) = self.tt {
+            if tt <= T::zero() {
+                return Err(PidError::InvalidBackCalculationTrackingTime);
+            }
+        }
+
+        Ok(self.next_control_output(measurement))
     }
 
     /// Given a new measurement, calculates the next [control output](ControlOutput).
@@ -554,7 +579,7 @@ fn apply_limit2<T: Number>(min: T, max: T, value: T) -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::Pid;
+    use super::{Pid, PidError};
     use crate::ControlOutput;
 
     fn never_integrate(_u_pred: f64, _i_min: f64, _i_max: f64, _error: f64) -> bool {
@@ -642,18 +667,65 @@ mod tests {
         assert_eq!(pid.next_control_output(20.0).i, -10.0);
     }
 
-    /// Invalid asymmetric limits should not change the existing integral settings.
+    /// Checked output rejects invalid asymmetric integral limits.
     #[test]
-    fn invalid_asymmetric_limits_are_ignored() {
+    fn safe_next_control_output_rejects_invalid_integral_limits() {
         let mut pid: Pid<f64> = Pid::new(10.0, 100.0);
         pid.p(0.0, 100.0).i(1.0, 5.0).d(0.0, 100.0);
 
         pid.i2(2.0, 10.0, -10.0);
 
-        assert_eq!(pid.ki, 1.0);
-        assert_eq!(pid.i_min, -5.0);
-        assert_eq!(pid.i_max, 5.0);
-        assert_eq!(pid.i_limit, 5.0);
+        assert_eq!(
+            pid.safe_next_control_output(0.0),
+            Err(PidError::InvalidIntegralLimits)
+        );
+    }
+
+    /// Checked output returns the same control output for valid configuration.
+    #[test]
+    fn safe_next_control_output_returns_control_output() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(1.0, 100.0).i(0.1, 100.0).d(1.0, 100.0);
+
+        assert_eq!(
+            pid.safe_next_control_output(0.0),
+            Ok(ControlOutput {
+                p: 10.0,
+                i: 1.0,
+                d: 0.0,
+                output: 11.0,
+            })
+        );
+    }
+
+    /// Checked output rejects an integrator leak rate outside 0..=1.
+    #[test]
+    fn safe_next_control_output_rejects_invalid_integrator_leak_rate() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_integrator_leak(1.5);
+
+        assert_eq!(
+            pid.safe_next_control_output(0.0),
+            Err(PidError::InvalidIntegratorLeakRate)
+        );
+    }
+
+    /// Checked output rejects a non-positive back-calculation tracking time.
+    #[test]
+    fn safe_next_control_output_rejects_invalid_back_calculation_tracking_time() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_back_calculation(Some(0.0));
+
+        assert_eq!(
+            pid.safe_next_control_output(0.0),
+            Err(PidError::InvalidBackCalculationTrackingTime)
+        );
     }
 
     /// Conditional integration skips accumulation when its condition returns false.
@@ -667,6 +739,22 @@ mod tests {
 
         assert_eq!(pid.next_control_output(0.0).i, 0.0);
         assert_eq!(pid.next_control_output(0.0).i, 0.0);
+    }
+
+    /// Disabling conditional integration resumes normal integral accumulation.
+    #[test]
+    fn anti_windup_disable_conditional_integration() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_conditional_integration(never_integrate);
+
+        assert_eq!(pid.next_control_output(0.0).i, 0.0);
+
+        pid.diable_aw_conditional_integration();
+
+        assert_eq!(pid.next_control_output(0.0).i, 10.0);
     }
 
     /// Integrator leak decays the stored integral before the next integration step.
@@ -683,6 +771,23 @@ mod tests {
         pid.setpoint(0.0);
 
         assert_eq!(pid.next_control_output(0.0).i, 5.0);
+    }
+
+    /// Disabling integrator leak stops decay of the stored integral term.
+    #[test]
+    fn anti_windup_disable_integrator_leak() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_integrator_leak(0.5);
+
+        assert_eq!(pid.next_control_output(0.0).i, 10.0);
+
+        pid.setpoint(0.0);
+        pid.disable_aw_integrator_leak();
+
+        assert_eq!(pid.next_control_output(0.0).i, 10.0);
     }
 
     /// Conditional integrator leak applies only when its condition returns true.
@@ -703,6 +808,41 @@ mod tests {
         assert_eq!(pid.next_control_output(0.0).i, 15.0);
     }
 
+    /// Disabling only the integrator leak condition keeps the leak rate active.
+    #[test]
+    fn anti_windup_disable_integrator_leak_condition() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_conditional_integrator_leak(0.5, leak_when_error_positive);
+
+        assert_eq!(pid.next_control_output(0.0).i, 10.0);
+
+        pid.setpoint(0.0);
+        assert_eq!(pid.next_control_output(0.0).i, 10.0);
+
+        pid.disable_aw_integrator_leak_condition();
+
+        assert_eq!(pid.next_control_output(0.0).i, 5.0);
+    }
+
+    /// Disabling integrator leak also clears the conditional leak strategy.
+    #[test]
+    fn anti_windup_disable_conditional_integrator_leak() {
+        let mut pid = Pid::new(10.0, 100.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_conditional_integrator_leak(0.5, leak_when_error_positive);
+
+        assert_eq!(pid.next_control_output(0.0).i, 10.0);
+
+        pid.disable_aw_integrator_leak();
+
+        assert_eq!(pid.next_control_output(0.0).i, 20.0);
+    }
+
     /// Back-calculation feeds output saturation back into the integral term.
     #[test]
     fn anti_windup_back_calculation() {
@@ -721,9 +861,29 @@ mod tests {
         assert_eq!(out.output, 10.0);
     }
 
-    /// Back-calculation and conditional integration are mutually exclusive.
+    /// Disabling back-calculation resumes standard integral accumulation.
     #[test]
-    fn back_calculation_disables_conditional_integration() {
+    fn anti_windup_disable_back_calculation() {
+        let mut pid = Pid::new(10.0, 10.0);
+        pid.p(0.0, 100.0)
+            .i(1.0, 100.0)
+            .d(0.0, 100.0)
+            .aw_back_calculation(Some(2.0));
+
+        let out = pid.next_control_output(0.0);
+        assert_eq!(out.i, 10.0);
+        assert_eq!(out.output, 10.0);
+
+        pid.diable_aw_back_calcualtion();
+
+        let out = pid.safe_next_control_output(0.0).unwrap();
+        assert_eq!(out.i, 20.0);
+        assert_eq!(out.output, 10.0);
+    }
+
+    /// Checked output rejects back-calculation combined with conditional integration.
+    #[test]
+    fn safe_next_control_output_rejects_back_calculation_with_conditional_integration() {
         let mut pid = Pid::new(10.0, 10.0);
         pid.p(0.0, 100.0)
             .i(1.0, 100.0)
@@ -731,12 +891,15 @@ mod tests {
             .aw_conditional_integration(never_integrate)
             .aw_back_calculation(Some(2.0));
 
-        assert_eq!(pid.next_control_output(0.0).i, 10.0);
+        assert_eq!(
+            pid.safe_next_control_output(0.0),
+            Err(PidError::AntiWindupCombinationError)
+        );
     }
 
-    /// Enabling integrator leak disables a previously configured back-calculation mode.
+    /// Checked output rejects back-calculation combined with integrator leak.
     #[test]
-    fn integrator_leak_disables_back_calculation() {
+    fn safe_next_control_output_rejects_back_calculation_with_integrator_leak() {
         let mut pid = Pid::new(10.0, 10.0);
         pid.p(0.0, 100.0)
             .i(1.0, 100.0)
@@ -744,11 +907,10 @@ mod tests {
             .aw_back_calculation(Some(2.0))
             .aw_integrator_leak(0.5);
 
-        assert_eq!(pid.next_control_output(0.0).i, 10.0);
-
-        pid.setpoint(0.0);
-
-        assert_eq!(pid.next_control_output(0.0).i, 5.0);
+        assert_eq!(
+            pid.safe_next_control_output(0.0),
+            Err(PidError::AntiWindupCombinationError)
+        );
     }
 
     /// Checks that a full PID controller's limits work properly through multiple output iterations
