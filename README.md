@@ -31,15 +31,6 @@ A proportional-integral-derivative (PID) controller.
 * Checked output via `safe_next_control_output`, which returns `PidError` for
   invalid anti-windup configuration.
 
-## Cargo Features
-
-This crate has no default features.
-
-```toml
-[dependencies]
-pid = "4.1.0"
-```
-
 ## Example
 
 ```rust
